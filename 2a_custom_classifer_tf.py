@@ -30,8 +30,8 @@ import numpy as np
 
 # USER SPECIFICATIONS
 # BERT_MODEL_NAME = "google/bert_uncased_L-4_H-256_A-4"
-BERT_MODEL_NAME = ""  # Location of BERT model
-MODEL_SAVE_LOC = ""  # Where to save model during training
+BERT_MODEL_NAME = r"C:\Users\jgolliher\OneDrive - American Bureau of Shipping\BERT Models\bert_uncased_L-4_H-256_A-4"  # Location of BERT model
+MODEL_SAVE_LOC = "C:/Users/jgolliher"  # Where to save model during training
 BATCH_SIZE = 72
 NUM_EPOCHS = 5
 PATIENCE = 2
@@ -178,12 +178,6 @@ class BertLayer(tf.keras.layers.Layer):
 bert_layer = BertLayer(BERT_MODEL_NAME, trainable=False)
 bert_output = bert_layer([input_ids, attention_mask])
 
-bert_model = TFBertModel.from_pretrained(BERT_MODEL_NAME)
-bert_output = bert_model([input_ids, attention_mask])["pooler_output"]
-
-outputs = bert_model([input_ids, attention_mask])
-bert_output = outputs.pooler_output
-
 
 # Define dense and output layer
 dense = tf.keras.layers.Dense(units=256, activation="relu", name="dense")(bert_output)
@@ -197,7 +191,7 @@ model = tf.keras.Model(
 )
 
 # Model summary
-# model.summary()
+model.summary()
 
 
 #########################
