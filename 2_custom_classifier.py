@@ -5,8 +5,8 @@ that together as well. Generally speaking, Transformers (the package) is better
 supported with PyTorch.
 
 It's possible to do most of this *within* Transformers only using the
-`BertForSequenceClassification`, but I think this demonstrates how 
-BERT works better. 
+`BertForSequenceClassification`, but I think this demonstrates how
+BERT works better.
 """
 
 #################################
@@ -64,17 +64,21 @@ def preprocess_function(examples):
 tokenized_imdb = imdb.map(preprocess_function, batched=True)
 
 # Pull out input_ids, attention_masks, and labels
+
+# Train: Used to fit model
 x_train_input_ids = np.array(tokenized_imdb["train"]["input_ids"])
 x_train_attention_mask = np.array(tokenized_imdb["train"]["attention_mask"])
 y_train = np.array(tokenized_imdb["train"]["label"])
 
-x_test_input_ids = np.array(tokenized_imdb["test"]["input_ids"])
-x_test_attention_mask = np.array(tokenized_imdb["test"]["attention_mask"])
-y_test = np.array(tokenized_imdb["test"]["label"])
+# Val: Used to test performance after each epoch (to avoid overfitting)
+x_val_input_ids = np.array(tokenized_imdb["test"]["input_ids"])
+x_val_attention_mask = np.array(tokenized_imdb["test"]["attention_mask"])
+y_val = np.array(tokenized_imdb["test"]["label"])
 
-x_val_input_ids = np.array(tokenized_imdb["unsupervised"]["input_ids"])
-x_val_attention_mask = np.array(tokenized_imdb["unsupervised"]["attention_mask"])
-y_val = np.array(tokenized_imdb["unsupervised"]["label"])
+# Test: Holdout set.
+x_test_input_ids = np.array(tokenized_imdb["unsupervised"]["input_ids"])
+x_test_attention_mask = np.array(tokenized_imdb["unsupervised"]["attention_mask"])
+y_test = np.array(tokenized_imdb["unsupervised"]["label"])
 
 
 # PyTorch datasets and model
