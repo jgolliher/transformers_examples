@@ -56,9 +56,9 @@ class MatchingModel(torch.nn.Module):
         # Get the hidden size from the model's config for proper linear layer sizing
         hidden_size = self.bert.config.hidden_size
 
-        self.dense = torch.nn.Linear(hidden_size, 256)
+        self.dense = torch.nn.Linear(hidden_size, hidden_size)
         self.relu = torch.nn.ReLU()
-        self.output_layer = torch.nn.Linear(256, num_labels)
+        self.output_layer = torch.nn.Linear(hidden_size, num_labels)
 
         # Training state
         self.device = None
