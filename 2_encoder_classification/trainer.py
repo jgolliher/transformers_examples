@@ -11,6 +11,18 @@ from tqdm import tqdm
 from utils import EarlyStopping
 from model import MatchingModel
 
+# Version-compatible imports
+try:
+    # Newer PyTorch versions
+    from torch.amp import autocast, GradScaler
+
+    TORCH_AMP_AVAILABLE = True
+except ImportError:
+    # Older PyTorch versions
+    from torch.cuda.amp import autocast, GradScaler
+
+    TORCH_AMP_AVAILABLE = False
+
 
 @dataclass
 class TrainingConfig:
@@ -20,15 +32,19 @@ class TrainingConfig:
     including optimization, regularization, and logging parameters.
 
     Attributes:
-        num_epochs: Maximum number of training epochs.
-        batch_size: Number of samples per training batch.
-        learning_rate: Initial learning rate for AdamW optimizer.
-        warmup_ratio: Proportion of training steps for learning rate warmup.
-        patience: Number of epochs to wait before early stopping.
+        num_epochs (int): Maximum number of training epochs.
+        batch_size (int): Number of samples per training batch.
+        learning_rate (float): Initial learning rate for AdamW optimizer.
+        warmup_ratio (float): Proportion of training steps for learning rate warmup.
+        patience (int): Number of epochs to wait before early stopping.
         max_grad_norm: Maximum gradient norm for clipping.
-        weight_decay: L2 regularization strength.
-        save_best_only: Whether to save only the best model checkpoint.
-        log_dir: Directory path for saving training logs.
+        weight_decay (float): L2 regularization strength.
+        save_best_only (bool): Whether to save only the best model checkpoint.
+        log_dir (str): Directory path for saving training logs.
+        use_mixed_precision (bool): Whether to use automatic mixed precision
+            training. Defaults to True.
+        mixed_precision_dtype (str):  The desired dtype for mixed precision.
+            ('fp16' or 'bf16'). Defaults to 'fp16'.
     """
 
     num_epochs: int = 20
@@ -40,6 +56,8 @@ class TrainingConfig:
     weight_decay: float = 1.0
     save_best_only: bool = True
     log_dir: str = "logs"
+    use_mixed_precision: bool = True
+    mixed_precision_dtype: str = "fp16"
 
 
 class Trainer:
@@ -84,6 +102,44 @@ class Trainer:
         self.model.to(self.device)
         self.training_history = {}
         self._setup_logging()
+
+        # --- Device Error Handling ---
+        # If device is MPS and PyTorch version doesn't support it, raise error
+        if self.device.type == "mps" and not torch.backends.mps.is_available():
+            raise RuntimeError(
+                f"Device is set to 'mps' but the MPS backend is not available."
+            )
+
+        # --- Setup mixed precision ---
+        self.dtype = None
+        self.scaler = None
+        self.use_mixed_precision = self.config.use_mixed_precision and device.type in [
+            "cuda",
+            "mps",
+        ]
+        if self.use_mixed_precision:
+            # Set the desired precision
+            self.dtype = (
+                torch.bfloat16
+                if self.config.mixed_precision_dtype == "bf16"
+                and torch.cuda.is_available()
+                and torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+            print(
+                f"Training on {self.device} with mixed precision ({self.config.mixed_precision_dtype}) enabled."
+            )
+
+            # GradScaler is *ONLY* for CUDA
+            if self.device.type == "cuda":
+                if TORCH_AMP_AVAILABLE:
+                    # New API: specify device type
+                    self.scaler = GradScaler(device.type)
+                else:
+                    # Old API: no device parameter (CUDA only)
+                    self.scaler = GradScaler()
+            else:
+                print(f"Training on {self.device} with mixed-precision disabled.")
 
     def _setup_logging(self) -> None:
         """Configure logging for the training process.
@@ -146,24 +202,30 @@ class Trainer:
         scheduler: torch.optim.lr_scheduler.LambdaLR,
         epoch: int,
     ) -> Tuple[float, float]:
-        """Train the model for one epoch.
+        """Execute one training epoch with mixed precision and progress tracking.
 
-        Performs forward pass, loss computation, backpropagation, and parameter
-        updates for all batches in the training set. Includes gradient clipping
-        and progress tracking.
+        Processes all batches in the training data loader, applying forward pass,
+        loss calculation, backpropagation, and optimizer updates. Automatically
+        handles mixed precision training on CUDA devices and provides real-time
+        progress monitoring.
+
 
         Args:
-            train_loader: DataLoader containing training batches.
-            optimizer: PyTorch optimizer for parameter updates.
-            scheduler: Learning rate scheduler.
-            epoch: Current epoch number (0-indexed).
+            train_loader (DataLoader): Training data loader with labeled batches.
+            optimizer (torch.optim.Optimizer): Configured AdamW optimizer.
+            scheduler (Any): Learning rate scheduler for step-wise updates.
+            epoch (int): Current epoch number for progress display.
 
         Returns:
             tuple: (average_loss, average_accuracy) for the epoch.
 
         Note:
-            Model is set to training mode. Gradients are clipped to prevent
-            exploding gradients. Progress is displayed with tqdm.
+            Training Features:
+            - Automatic mixed precision on CUDA for memory and speed benefits
+            - Gradient clipping to prevent exploding gradients
+            - Real-time progress bar with loss and accuracy updates
+            - Per-step learning rate scheduling
+            - Proper model mode management (train mode)
         """
         self.model.train()
         total_loss, total_accuracy = 0.0, 0.0
@@ -182,22 +244,55 @@ class Trainer:
             }
 
             labels = batch["labels"].float()
-            outputs = self.model(inputs)
-
-            loss = self.loss_fn(outputs.squeeze(), labels)
-            total_loss += loss.item()
 
             optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config.max_grad_norm
-            )
-            optimizer.step()
+
+            # Use mixed-precision on CUDA or MPS
+            if self.use_mixed_precision:
+                # Version-compatible augocast usage
+                if TORCH_AMP_AVAILABLE:
+                    # New API: supports device_type and dtype parameters
+                    with autocast(device_type=self.device.type, dtype=self.dtype):
+                        outputs = self.model(inputs)
+                        loss = self.loss_fn(outputs.squeeze(-1), labels)
+                else:
+                    # Old API: Only supports enabled parameters, CUDA only
+                    with autocast(enabled=True):
+                        outputs = self.model(inputs)
+                        loss = self.loss_fn(outputs.squeeze(-1), labels)
+
+                # GradScaler is only for CUDA
+                if self.scaler:
+                    self.scaler.scale(loss).backward()
+                    self.scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.max_grad_norm
+                    )
+                    self.scaler.step(optimizer)
+                    self.scaler.update()
+                else:  # For MPS or if scaler is not used
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), self.config.max_grad_norm
+                    )
+                    optimizer.step()
+            else:  # Standard training on CPU
+                outputs = self.model(inputs)
+                loss = self.loss_fn(outputs.squeeze(-1), labels)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), self.config.max_grad_norm
+                )
+                optimizer.step()
+
             scheduler.step()
 
-            preds = (torch.sigmoid(outputs.squeeze()) > 0.5).float()
-            accuracy = (preds == labels).float().mean()
-            total_accuracy += accuracy.item()
+            total_loss += loss.item()
+
+            # Check accuracy calculation
+            preds = (outputs > 0).float()
+            preds = (preds.squeeze() == labels).float().mean().item()
+            total_accuracy += preds
 
             progress_bar.set_postfix(
                 loss=total_loss / (progress_bar.n + 1),
@@ -207,10 +302,11 @@ class Trainer:
         return total_loss / len(train_loader), total_accuracy / len(train_loader)
 
     def _validate_epoch(self, val_loader: DataLoader) -> Tuple[float, float]:
-        """Validate the model for one epoch.
+        """Executes one validation epoch with comprehensive metric tracking.
 
-        Evaluates model performance on validation set without updating parameters.
-        Computes loss and accuracy metrics for monitoring training progress.
+        Evaluates the model on the validation dataset without gradient computation,
+        providing unbiased estimates of model performance. Used for early stopping
+        decisions and best model selection during training.
 
         Args:
             val_loader: DataLoader containing validation batches.
@@ -219,14 +315,21 @@ class Trainer:
             tuple: (average_loss, average_accuracy) for the validation set.
 
         Note:
-            Model is set to evaluation mode and gradients are disabled for efficiency.
-            Uses the same loss function and accuracy computation as training.
+            Validation Features:
+            - Gradient computation disabled for efficiency
+            - Model set to evaluation mode
+            - Progress bar with real-time metrics
+            - No optimizer updates or learning rate changes
+            - Used for early stopping and model checkpointing decisions
         """
         self.model.eval()
         total_loss, total_accuracy = 0.0, 0.0
 
-        with torch.no_grad():
-            progress_bar = tqdm(val_loader, desc="Validation")
+        with torch.inference_mode():
+            progress_bar = tqdm(
+                val_loader,
+                desc="Validation",
+            )
             for batch in progress_bar:
                 batch = {
                     k: v.to(self.device) if torch.is_tensor(v) else v
@@ -239,49 +342,70 @@ class Trainer:
                 }
 
                 labels = batch["labels"].float()
+
                 outputs = self.model(inputs)
-                loss = self.loss_fn(outputs.squeeze(), labels)
+                loss = self.loss_fn(outputs.squeeze(-1), labels)
+
                 total_loss += loss.item()
 
-                preds = (torch.sigmoid(outputs.squeeze()) > 0.5).float()
-                accuracy = (preds == labels).float().mean()
-                total_accuracy += accuracy.item()
+                # Check accuracy calculation
+                preds = (outputs > 0).float()
+                preds = (preds.squeeze() == labels).float().mean().item()
+                total_accuracy += preds
 
                 progress_bar.set_postfix(
                     loss=total_loss / (progress_bar.n + 1),
                     acc=total_accuracy / (progress_bar.n + 1),
                 )
-
         return total_loss / len(val_loader), total_accuracy / len(val_loader)
 
     def fit(
         self, train_loader: DataLoader, val_loader: DataLoader, model_save_path: str
     ) -> Dict[str, List[Union[int, float]]]:
-        """Train the model with validation monitoring.
+        """Train the BERT model with comprehensive monitoring and optimization.
+
+        Executes the complete training loop including optimizer setup, learning rate
+        scheduling, training/validation cycles, progress tracking, model checkpointing,
+        and early stopping. Provides detailed loging and retrusn comprehensive training
+        history for analysis.
+
+        Train the model with validation monitoring.
 
         Executes the complete training loop including validation, early stopping,
         and model checkpointing. Tracks training history and logs progress.
 
         Args:
-            train_loader: DataLoader for training data.
-            val_loader: DataLoader for validation data.
-            model_save_path: Path where the best model checkpoint will be saved.
+            train_loader (DataLoader): PyTorch DataLoader for training data. Should use
+                BERTMatchingDataset with appropriate collate function and contain labeled
+                person pairs.
+            val_loader (DataLoader): PyTorch DataLoader for validation data. Used for
+                model evaluation, early stopping decisions, and best model selection.
+            model_save_path (str): File path where the best model (lowest validation loss)
+                will be saved. Should end with .pt, .pth, or .bin extension.
 
         Returns:
-            dict: Training history containing metrics for each epoch:
-                - epoch: List of epoch numbers
-                - epoch_time: List of training times per epoch
-                - train_loss: List of training losses
-                - train_acc: List of training accuracies
-                - val_loss: List of validation losses
-                - val_acc: List of validation accuracies
+            Dict[str, List]: Training history dictionary containing lists of metrics:
+                - 'epoch': Epoch numbers
+                - 'epoch_time': Time taken per epoch (seconds)
+                - 'train_loss': Training loss per epoch
+                - 'train_acc': Training accuracy per epoch
+                - 'val_loss': Validation loss per epoch
+                - 'val_acc': Validation accuracy per epoch
 
         Note:
             Saves the model with the best validation loss. Training can stop
             early if validation loss doesn't improve for 'patience' epochs.
         """
+        # Enable anamoly detection to get a stack trace on the exact operation
+        # if training producws NaN gradients
+        torch.autograd.set_detect_anomaly(True)
+
         self.logger.info("Starting training process...")
         self.logger.info(f"Device: {self.device}")
+        if not self.use_mixed_precision:
+            self.logger.info(f"Mixed precision disabled (CPU training)")
+        else:
+            self.logger.info(f"Mixed precision enabled (CUDA training)")
 
         num_training_steps = len(train_loader) * self.config.num_epochs
         optimizer, scheduler = self._create_optimizer_scheduler(num_training_steps)

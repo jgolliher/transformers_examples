@@ -45,6 +45,7 @@ from trainer import Trainer, TrainingConfig
 # --- 1. Define tokenizer ---
 BERT_MODEL = "google/bert_uncased_L-4_H-256_A-4"
 
+BERT_MODEL = "/Users/jgolliher/Files/BERT/bert_uncased_L-4_H-256_A-4"
 tokenizer = AutoTokenizer.from_pretrained(BERT_MODEL)
 
 # ---  2. Load Training Data----
@@ -65,7 +66,7 @@ train_dataset = MatchingDataset(path=train_lines, tokenizer=tokenizer, max_len=5
 # Build dataloader
 train_loader = DataLoader(
     train_dataset,
-    batch_size=8,
+    batch_size=32,
     shuffle=True,
     num_workers=0,
     collate_fn=MatchingDataset.pad,
@@ -87,7 +88,7 @@ val_dataset = MatchingDataset(path=val_lines, tokenizer=tokenizer, max_len=512)
 # Build dataloader
 val_loader = DataLoader(
     val_dataset,
-    batch_size=8,
+    batch_size=32,
     shuffle=False,
     num_workers=0,
     collate_fn=MatchingDataset.pad,
@@ -100,7 +101,11 @@ trainer = Trainer(
     model=model,
     config=TrainingConfig(),
     loss_fn=torch.nn.BCEWithLogitsLoss(),
-    device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
+    device=torch.device(
+        "mps"
+        if torch.backends.mps.is_available()
+        else ("cuda" if torch.cuda.is_available() else "cpu")
+    ),
 )
 
 # --- 5. Run Training ---
